@@ -1,0 +1,37 @@
+CUDA_VISIBLE_DEVICES=3,4 \
+swift  sft \
+    --model /BDSZ6/private/user/yxd/models/Qwen3-VL-8B-Instruct \
+    --save_safetensors true \
+    --tuner_type lora \
+    --dataset '/BDSZ6/private/user/yxd/data/qwen/agent_phase1/agent_train.jsonl' \
+    --val_dataset '/BDSZ6/private/user/yxd/data/qwen/agent_phase1/agent_val.jsonl' \
+    --load_from_cache_file true \
+    --split_dataset_ratio 0.01 \
+    --agent_template hermes \
+    --torch_dtype bfloat16 \
+    --num_train_epochs 5 \
+    --per_device_train_batch_size 1 \
+    --per_device_eval_batch_size 1 \
+    --learning_rate 1e-4 \
+    --lora_rank 64 \
+    --lora_alpha 128 \
+    --target_modules all-linear \
+    --freeze_vit true \
+    --freeze_aligner true \
+    --gradient_checkpointing true \
+    --vit_gradient_checkpointing true \
+    --gradient_accumulation_steps 2 \
+    --eval_steps 100 \
+    --save_steps 100 \
+    --save_total_limit 2 \
+    --logging_steps 50 \
+    --max_length 8192 \
+    --save_only_model true \
+    --packing true \
+    --use_liger_kernel true \
+    --output_dir '/BDSZ6/private/user/yxd/dtos_output/qwen/agent_phase1' \
+    --lr_warmup_fraction  0.05 \
+    --attn_impl flash_attn \
+    --dataloader_num_workers 4 \
+    --model_type 'qwen3_vl'\
+    --dataset_num_proc 16
