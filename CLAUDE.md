@@ -8,86 +8,111 @@ A 3D MRI lesion segmentation agent based on **Qwen3-VL** + **ms-swift** parallel
 
 ## Phased Roadmap
 
-| Phase | Task | Input | Output |
-|---|---|---|---|
-| **Phase 1 (current)** | Predict bbox per slice across 10 sampled slices | 10 slices + Z indices | `[x1,y1,x2,y2]` per slice |
-| Phase 2 | Use MedSAM2 to generate masks from bbox, refine with points | Same + bbox results | Per-slice segmentation mask |
-| Phase 3 | Dynamic scroll/get_slice interactive segmentation | Single slice + history | Full 3D segmentation |
+| Phase | Task | Input | Output | Status |
+|---|---|---|---|---|
+| **Phase 1** | Predict bbox per slice across 10 sampled slices | 10 slices + Z indices | `[x1,y1,x2,y2]` per slice | **Done** |
+| **Phase 2** | Use MedSAM2 to generate masks from bbox, refine with points | Same + bbox results | Per-slice segmentation mask | **Done** |
+| **Phase 3** | Dynamic scroll/get_slice interactive segmentation | Single slice + history | Full 3D segmentation | Next |
 
 ## Repository Structure
 
 ```
 medagent/
-├── CLAUDE.md                            # This file
-├── Agent-support.md                     # ms-swift agent framework docs
+├── CLAUDE.md                                   # This file
+├── Agent-support.md                            # ms-swift agent framework docs
+├── MedSAM2/                                    # MedSAM2 submodule
+│   ├── checkpoints/MedSAM2/MedSAM2_latest.pt  # Model checkpoint
+│   └── sam2/configs/sam2.1_hiera_t512.yaml     # Hydra config (512×512 input)
+├── agent/
+│   ├── qwen3_mcore.sh                          # Phase 2 training (2-GPU, no DeepSpeed)
+│   └── eval.sh                                 # swift infer evaluation script
 └── Qwen3_VL/
-    ├── train.sh                         # Standard LoRA training (CUDA 4,5)
-    ├── train_mri.sh                     # LoRA training with custom MRI bbox loss
-    ├── eval.sh                          # Inference + VLMEvalKit evaluation
-    ├── infer.py                         # Batch inference with IoU/mAP metrics
-    ├── custom_loss.py                   # MRIBboxLoss: weighted CE + Smooth-L1
-    ├── convert_to_swift_grounding.py    # Convert raw M3D data → ms-swift JSONL
-    ├── convert_to_swift_grounding2.py   # Alternative conversion pipeline
-    ├── visualize_grounding.py           # Visualize bbox predictions on slices
-    ├── mri_grounding_train.jsonl        # Training dataset
-    ├── mri_grounding_val.jsonl          # Validation dataset
-    ├── loss/                            # Loss function module (base, causal_lm, etc.)
-    └── custom/                          # Custom model/dataset registration for ms-swift
+    ├── train.sh                                # Phase 1 LoRA training (GPU 4,5)
+    ├── train_phase2.sh                         # Phase 2 LoRA training (GPU 4,5,6,7)
+    ├── infer.py                                # Phase 1 batch inference (IoU/mAP)
+    ├── infer_phase2.py                         # Phase 2 agent inference (Dice/HD95)
+    ├── visualize_phase2.py                     # Phase 2 result visualizer
+    ├── custom_loss.py                          # MRIBboxLoss: weighted CE + Smooth-L1
+    ├── convert_to_swift_grounding.py           # Phase 1 data: M3D → ms-swift JSONL
+    ├── convert_to_agent_trajectory.py          # Phase 1 agent trajectory generator
+    ├── convert_to_agent_trajectory_phase2.py   # Phase 2 trajectory generator
+    ├── medsam2_phase2.py                       # Standalone MedSAM2 inference + Dice
+    ├── PHASE2_WORKFLOW.md                      # Full Phase 2 documentation
+    ├── mri_grounding_train.jsonl               # Phase 1 training dataset
+    ├── mri_grounding_val.jsonl                 # Phase 1 validation dataset
+    ├── loss/                                   # Loss function module
+    └── custom/                                 # Custom model/dataset for ms-swift
 ```
 
 ## Common Commands
-CUDA_VISIBLE_DEVICES=4,5,6,7
-you can only use GPU 4,5,6,7
-### Training
+
+> **GPU constraint**: only GPUs 0,7 are available (`CUDA_VISIBLE_DEVICES=0,7`).
+> **Conda environments**: `qwen3` for training/ms-swift and MedSAM2 inference.
+
+### Phase 1 Training
 
 ```bash
-# Standard LoRA fine-tuning (GPUs 4,5; bfloat16; DeepSpeed Zero-2)
-bash Qwen3_VL/train.sh
-
-# Training with custom MRI bbox loss (weighted CE + L1 coordinate regression)
-bash Qwen3_VL/train_mri.sh
+bash Qwen3_VL/train.sh          # LoRA, GPU 4,5, DeepSpeed Zero-2
 ```
 
-### Inference and Evaluation
+### Phase 2 Training
 
 ```bash
-# Batch inference with automatic IoU/AP metrics
+bash Qwen3_VL/train_phase2.sh   # LoRA, GPU 4,5,6,7, DeepSpeed Zero-2
+# or
+bash agent/qwen3_mcore.sh       # LoRA, GPU 3,7, no DeepSpeed
+```
+
+### Phase 2 Dataset Generation
+
+```bash
+# Full run with real MedSAM2 masks (dtos_test env):
+conda run -n dtos_test python3 Qwen3_VL/convert_to_agent_trajectory_phase2.py \
+    --data_root /BDSZ6/private/user/yxd/data/M3D/data_6-13/train \
+    --output_dir /BDSZ6/private/user/yxd/data/qwen/agent_phase2 \
+    --ckpt /home/yxd/medagent/MedSAM2/checkpoints/MedSAM2/MedSAM2_latest.pt \
+    --cfg  /home/yxd/medagent/MedSAM2/sam2/configs/sam2.1_hiera_t512.yaml \
+    --device cuda:4
+
+# Quick validation (3 samples, no GPU):
+conda run -n qwen3 python3 Qwen3_VL/convert_to_agent_trajectory_phase2.py \
+    --data_root /BDSZ6/private/user/yxd/data/M3D/data_6-13/train \
+    --output_dir /tmp/phase2_test --max_samples 3 --device cpu
+```
+
+### Phase 2 Inference and Evaluation
+
+```bash
+# Agent-loop inference with Dice/HD95/Precision/Recall (qwen3 env):
+conda run -n qwen3 python3 Qwen3_VL/infer_phase2.py \
+    --model  /BDSZ6/private/user/yxd/models/Qwen/Qwen3-VL-8B-Instruct \
+    --ckpt   /path/to/checkpoint \
+    --val_jsonl /BDSZ6/private/user/yxd/data/qwen/agent_phase2/agent_val.jsonl \
+    --data_root /BDSZ6/private/user/yxd/data/M3D/data_6-13/train \
+    --medsam2_ckpt /home/yxd/medagent/MedSAM2/checkpoints/MedSAM2/MedSAM2_latest.pt \
+    --medsam2_cfg  /home/yxd/medagent/MedSAM2/sam2/configs/sam2.1_hiera_t512.yaml \
+    --output_dir /tmp/phase2_eval --device cuda:4
+
+# Swift batch inference (eval.sh pattern):
+bash agent/eval.sh   # uses --load_data_args true to read val set from training args
+
+# Visualize swift infer results (re-runs MedSAM2 with model's predicted bboxes):
+conda run -n dtos_test python3 Qwen3_VL/visualize_phase2.py \
+    --infer_jsonl /path/to/infer_result/*.jsonl \
+    --data_root   /BDSZ6/private/user/yxd/data/M3D/data_6-13/train \
+    --medsam2_ckpt /home/yxd/medagent/MedSAM2/checkpoints/MedSAM2/MedSAM2_latest.pt \
+    --medsam2_cfg  /home/yxd/medagent/MedSAM2/sam2/configs/sam2.1_hiera_t512.yaml \
+    --output_dir /tmp/phase2_vis --device cuda:4
+```
+
+### Phase 1 Inference
+
+```bash
 python Qwen3_VL/infer.py \
     --model /BDSZ6/private/user/yxd/models/Qwen/Qwen3-VL-8B-Instruct \
     --ckpt /path/to/adapter \
     --jsonl Qwen3_VL/mri_grounding_val.jsonl \
-    --batch-size 4 \
-    --coord-mode norm1000
-
-# ms-swift streaming inference
-swift infer --adapters <ckpt> --stream true
-
-# VLMEvalKit evaluation (see eval.sh for full config)
-swift eval --eval_backend VLMEvalKit
-```
-
-### Data Preparation
-
-```bash
-# Convert raw M3D data to ms-swift grounding JSONL
-python Qwen3_VL/convert_to_swift_grounding.py \
-    --data_root /path/to/M3D/data/train \
-    --output_dir /path/to/output \
-    --train_ratio 0.8 \
-    --include_negatives
-
-# Visualize bbox annotations on validation set (first 20 samples)
-python Qwen3_VL/visualize_grounding.py \
-    --jsonl Qwen3_VL/mri_grounding_val.jsonl \
-    --output /tmp/viz \
-    --n 20
-```
-
-### Format Validation
-
-```bash
-python Qwen3_VL/test_grouding.py
-python Qwen3_VL/test_dataset.py
+    --batch-size 4 --coord-mode norm1000
 ```
 
 ## Key Server Paths
@@ -95,9 +120,13 @@ python Qwen3_VL/test_dataset.py
 | Resource | Path |
 |---|---|
 | Base model | `/BDSZ6/private/user/yxd/models/Qwen/Qwen3-VL-8B-Instruct` |
-| Data root | `/BDSZ6/private/user/yxd/data/qwen/` |
+| M3D data (phases 1–2) | `/BDSZ6/private/user/yxd/data/M3D/data_6-13/train` |
+| Phase 2 dataset | `/BDSZ6/private/user/yxd/data/qwen/agent_phase2/` |
+| Phase 2 renders | `/BDSZ6/private/user/yxd/data/qwen/agent_phase2/renders/` |
 | Training output | `/BDSZ6/private/user/yxd/dtos_output/qwen/` |
-| MRI bbox output | `/dtos_output/qwen/qwen3vl_mri_bbox` |
+| Phase 2 checkpoints | `/BDSZ6/private/user/yxd/dtos_output/qwen/agent_phase2/` |
+| MedSAM2 checkpoint | `/home/yxd/medagent/MedSAM2/checkpoints/MedSAM2/MedSAM2_latest.pt` |
+| MedSAM2 config | `/home/yxd/medagent/MedSAM2/sam2/configs/sam2.1_hiera_t512.yaml` |
 
 ---
 
@@ -371,3 +400,144 @@ def inject_bbox_failure(initial_bboxes, target_z, offset_ratio=0.25):
     ]
     return initial_bboxes
 ```
+
+---
+
+## Phase 2 Design Spec
+
+> Full documentation: `Qwen3_VL/PHASE2_WORKFLOW.md`
+
+### Goal
+
+Extend Phase 1 to full 3D segmentation. After the agent annotates bboxes on 10 sampled slices and verifies them, it seeds MedSAM2 from the key (largest cross-section) slice and propagates the mask forward and backward through the entire volume. Poorly-segmented slices (Dice < 0.70) are refined with point prompts.
+
+### Tool Schema (Phase 2)
+
+```
+add_bbox(z_index, bbox)                       # same as Phase 1
+run_medsam2(key_z, bbox)                      # seeds 3D propagation from key slice
+add_point(z_index, points, labels)            # refine one slice with fg/bg points
+finish_3d_segmentation()                      # terminal tool
+```
+
+`run_medsam2` makes **one** tool_call → **one** tool_response that packs ALL N mask images into a `slices` array, satisfying ms-swift's 1:1 pairing requirement.
+
+### Trajectory Structure (15 turns)
+
+```
+Turn 1   [user]            Task + 10 Z-indexed MRI slices
+Turn 2   [assistant]       Global spatial analysis CoT
+Turn 3   [tool_call × N]   Parallel add_bbox (N = lesion slices)
+Turn 4   [tool_resp × N]   Bbox render + IoU per slice
+Turn 5   [assistant]       Bbox review CoT (PASS/FAIL per slice)
+Turn 6   [tool_call × M]   Correction add_bbox (M = failing slices, skip if 0)
+Turn 7   [tool_resp × M]   Corrected bbox renders
+Turn 8   [assistant]       "Verified. Initiating 3D segmentation from Z=K …"
+Turn 9   [tool_call]       run_medsam2(key_z=K, bbox=[...])
+Turn 10  [tool_response]   All N mask images + Dice per slice
+Turn 11  [assistant]       Mask review CoT
+Turn 12  [tool_call × P]   Parallel add_point (P = Dice < 0.70 slices)
+Turn 13  [tool_resp × P]   Refined mask + Dice per slice
+Turn 14  [assistant]       "All slices pass. Segmentation complete."
+Turn 15  [tool_call]       finish_3d_segmentation()
+```
+
+### MedSAM2 Propagation Protocol
+
+Three separate init/propagate/reset cycles to avoid state contamination:
+
+```python
+# Phase A: get key-slice mask from bbox
+state = predictor.init_state(img_tensor, orig_H, orig_W)
+_, _, logits = predictor.add_new_points_or_box(state, frame_idx=key_z, obj_id=1, box=bbox_512)
+key_mask = (logits[0] > 0.0).squeeze(0).cpu().numpy().astype(np.uint8)
+predictor.reset_state(state)
+
+# Phase B: forward propagation seeded with key_mask
+state = predictor.init_state(img_tensor, orig_H, orig_W)
+predictor.add_new_mask(state, frame_idx=key_z, obj_id=1, mask=key_mask)
+for fidx, _, lg in predictor.propagate_in_video(state, start_frame_idx=key_z, reverse=False):
+    result[fidx] = (lg[0] > 0.0).cpu().numpy()[0].astype(bool)
+predictor.reset_state(state)
+
+# Phase C: backward propagation
+state = predictor.init_state(img_tensor, orig_H, orig_W)
+predictor.add_new_mask(state, frame_idx=key_z, obj_id=1, mask=key_mask)
+for fidx, _, lg in predictor.propagate_in_video(state, start_frame_idx=key_z, reverse=True):
+    result[fidx] = (lg[0] > 0.0).cpu().numpy()[0].astype(bool)
+predictor.reset_state(state)
+```
+
+**Critical**: always pass `apply_postprocessing=False` to `build_sam2_video_predictor_npz`. The default `fill_holes_in_mask_scores` CUDA kernel causes illegal memory access on this hardware.
+
+**Hydra config path fix**: absolute paths need `//` prefix:
+```python
+if os.path.isabs(cfg_path) and not cfg_path.startswith('//'):
+    cfg_path = '//' + cfg_path
+```
+
+### Dataset Statistics (Phase 2)
+
+| Split | Samples | add_bbox | run_medsam2 | add_point | finish |
+|---|---|---|---|---|---|
+| Train | 298 | 2900 | 298 | 705 | 298 |
+| Val | 33 | 326 | 33 | 55 | 33 |
+
+- Mean tokens/sample: ~7,110 (text ~1,924 + ~32 images)
+- Input slices: 512×512 (~333 tokens each)
+- Render images (bbox overlays + mask overlays): **256×256** (~84 tokens each)
+
+### Token Length Issue and Fix
+
+**Problem**: with `max_length=8192`, only 4/298 samples survived — trajectories have ~32 images and at 333 tokens/image exceed 8192 before any text.
+
+**Fix**:
+1. Render images (bbox/mask overlays) saved at **256×256** instead of 512×512 → ~84 tokens each
+2. `max_length` increased to **12288** in training scripts
+
+### Training Parameters (Phase 2)
+
+```bash
+--agent_template hermes   # required for Qwen3 parallel tool calling
+--max_length 12288        # was 8192; needed for 30+ images per trajectory
+--lora_rank 8
+--freeze_vit true
+--freeze_aligner true
+--packing true
+--attn_impl flash_attn
+--deepspeed zero2         # (train_phase2.sh only)
+```
+
+### Evaluation Results (checkpoint-300, val set n=33)
+
+| Metric | Mean | Std | Min | Max |
+|---|---|---|---|---|
+| Dice | 0.826 | 0.127 | 0.303 | 0.953 |
+| Precision | 0.849 | 0.151 | 0.186 | 0.991 |
+| Recall | 0.826 | 0.110 | 0.530 | 0.978 |
+| HD95 (px) | 9.50 | 12.91 | 1.0 | 48.6 |
+
+Evaluated by re-running MedSAM2 with the model's predicted `run_medsam2(key_z, bbox)` args on all annotated Z frames (not just the 10 sampled). Visualizations saved to `vis/figures/{vid}.png` (per-case grids) and `vis/summary.png`.
+
+### Annotation Matching (val JSONL → mask_dict)
+
+Index-based split matching is unreliable because `build_trajectory` skips some annotations. Always match by `(vid, caption)`:
+
+```python
+vid     = Path(rec['images'][0]['path']).parent.name
+caption = re.search(r'The target structure is:\s*"([^"]+)"', user_text).group(1)
+anno    = anno_lookup[(vid, caption)]
+```
+
+---
+
+## Phase 3 Design Notes (upcoming)
+
+Phase 3 adds interactive scrolling: the agent can call `scroll(delta)` and `get_slice(z)` to navigate the volume on demand, rather than being shown all 10 slices upfront. This enables finer-grained control for difficult cases and is compatible with the Phase 2 tool set (just add `scroll` and `get_slice`).
+
+Planned tool set:
+```
+add_bbox   run_medsam2   add_point   scroll(delta)   get_slice(z)   finish_3d_segmentation
+```
+
+The Phase 2 dataset JSONL format is already forward-compatible — only the `tools` field needs extension.
