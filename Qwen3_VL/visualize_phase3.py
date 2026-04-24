@@ -1,28 +1,19 @@
 #!/usr/bin/env python3
 """
-Visualize Phase-2 inference results.
+Visualize Phase-3 inference results.
 
-Reads an inference result JSONL produced by `swift infer` (eval.sh),
-re-runs MedSAM2 with the model's predicted bboxes and point prompts,
-computes Dice / HD95 / Precision / Recall against GT annotations, and
-saves per-case side-by-side comparison figures.
-
-Layout per figure (one file per case):
-    Each row = one sampled Z slice that contains lesion
-    Col 0   : original MRI slice (grayscale)
-    Col 1   : GT mask overlay (blue)
-    Col 2   : predicted mask overlay (green)
-    Col 3   : overlap map  (TP=white, FN=blue, FP=green)
-    Sidebar : per-slice metric text
+Same metric/figure format as ``visualize_phase2.py``, but adapted for Phase-3
+trajectories in which Turn-1 carries no slice images — the sampled Z list is
+written in plain text, and the volume id has to be recovered from a render
+filename.
 
 Usage:
-    conda run -n dtos_test python3 Qwen3_VL/visualize_phase2.py \
-        --infer_jsonl /BDSZ6/private/user/yxd/dtos_output/qwen/agent_phase2/\
-v3-20260417-100443/checkpoint-300/infer_result/20260418-145802.jsonl \
+    conda run -n dtos_test python3 Qwen3_VL/visualize_phase3.py \
+        --infer_jsonl /BDSZ6/private/user/yxd/dtos_output/qwen/agent_phase3/v0-20260419-225116/checkpoint-200/infer_result \
         --data_root   /BDSZ6/private/user/yxd/data/M3D/data_6-13/train \
         --medsam2_ckpt /home/yxd/medagent/MedSAM2/checkpoints/MedSAM2/MedSAM2_latest.pt \
         --medsam2_cfg  /home/yxd/medagent/MedSAM2/sam2/configs/sam2.1_hiera_t512.yaml \
-        --output_dir  /home/yxd/medagent/output \
+        --output_dir  /home/yxd/medagent/output/phase3_vis \
         --device cuda:4
 """
 
@@ -51,8 +42,9 @@ sys.path.insert(0, str(MEDSAM2_ROOT))
 IMG_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32)
 IMG_STD  = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32)
 
-CAPTION_RE  = re.compile(r'The target structure is:\s*"([^"]+)"')
-SAMPLED_RE  = re.compile(r'Z=(\d+):')
+CAPTION_RE      = re.compile(r'The target structure is:\s*"([^"]+)"')
+SAMPLED_LIST_RE = re.compile(r'Sampled Z list[^:]*:\s*\[([^\]]+)\]')
+VID_FROM_RENDER = re.compile(r'/([^/]+?)_z\d+_(?:raw|bbox|mask|refined)\.png$')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -91,10 +83,6 @@ def hd95(pred, gt):
 
 
 def compute_metrics(pred_masks: dict, masks: list, non_none_z: list) -> dict:
-    """
-    pred_masks: {z: bool ndarray (512,512)}
-    Evaluate on every annotated Z in the volume.
-    """
     vol_pred, vol_gt, per_frame = [], [], []
     for z in non_none_z:
         m = masks[z]
@@ -180,43 +168,47 @@ def medsam2_point(predictor, img_tensor, orig_H, orig_W,
 # Parse inference JSONL record
 # ─────────────────────────────────────────────────────────────────────────────
 
-def parse_record(rec: dict) -> dict:
-    """Extract everything the model predicted from one inference result record."""
-    user_text = rec['messages'][0]['content']
-    vid       = Path(rec['images'][0]['path']).parent.name
-    caption   = CAPTION_RE.search(user_text).group(1)
-    sampled   = list(map(int, SAMPLED_RE.findall(user_text)))
+def _extract_vid(images: list) -> str | None:
+    for img in images:
+        p = img.get('path') if isinstance(img, dict) else str(img)
+        if not p:
+            continue
+        m = VID_FROM_RENDER.search(p)
+        if m:
+            return m.group(1)
+    return None
 
-    add_bboxes   = {}   # {z: [x1,y1,x2,y2]}
+
+def parse_record(rec: dict) -> dict:
+    """Extract everything the model predicted from one Phase-3 inference record."""
+    user_text = rec['messages'][0]['content']
+    vid       = _extract_vid(rec.get('images', []))
+    caption_m = CAPTION_RE.search(user_text)
+    sampled_m = SAMPLED_LIST_RE.search(user_text)
+    caption   = caption_m.group(1) if caption_m else ''
+    sampled   = ([int(x.strip()) for x in sampled_m.group(1).split(',')]
+                 if sampled_m else [])
+
+    add_bboxes   = {}
     medsam2_call = None
-    add_points   = {}   # {z: {'points':..,'labels':..}}
+    add_points   = {}
 
     for m in rec['messages']:
         if m['role'] != 'tool_call':
             continue
-        tc   = json.loads(m['content'])
-        name = tc['name']
-        args = tc['arguments']
+        try:
+            tc = json.loads(m['content'])
+        except Exception:
+            continue
+        name = tc.get('name')
+        args = tc.get('arguments', {}) or {}
         if name == 'add_bbox':
-            add_bboxes[args['z_index']] = args['bbox']
+            add_bboxes[int(args['z_index'])] = list(args['bbox'])
         elif name == 'run_medsam2':
-            medsam2_call = args   # {'key_z': int, 'bbox': [...]}
+            medsam2_call = {'key_z': int(args['key_z']), 'bbox': list(args['bbox'])}
         elif name == 'add_point':
-            add_points[args['z_index']] = {
+            add_points[int(args['z_index'])] = {
                 'points': args['points'], 'labels': args['labels']}
-
-    # Also pull the dice_with_gt scores from the run_medsam2 tool_response
-    # (these are the tool-execution results, useful for quick display)
-    medsam2_dice = {}
-    for m in rec['messages']:
-        if m['role'] == 'tool_response':
-            try:
-                data = json.loads(m['content'])
-                if data.get('status') == 'propagation_complete':
-                    for s in data.get('slices', []):
-                        medsam2_dice[s['z_index']] = s.get('dice_with_gt', None)
-            except Exception:
-                pass
 
     return {
         'vid':         vid,
@@ -225,7 +217,6 @@ def parse_record(rec: dict) -> dict:
         'add_bboxes':  add_bboxes,
         'medsam2':     medsam2_call,
         'add_points':  add_points,
-        'medsam2_dice': medsam2_dice,
     }
 
 
@@ -242,7 +233,6 @@ def load_data(data_root: str):
 
 
 def build_anno_lookup(meta, mask_dict) -> dict:
-    """(vid, caption) → annotation dict."""
     lookup = {}
     idx = 0
     for vid in sorted(meta.keys()):
@@ -267,7 +257,6 @@ def build_anno_lookup(meta, mask_dict) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _overlay(gray_img: np.ndarray, mask: np.ndarray, color_rgb, alpha=0.45) -> np.ndarray:
-    """Blend a binary mask over a grayscale image (H×W uint8 → H×W×3 uint8)."""
     if gray_img.ndim == 2:
         rgb = np.stack([gray_img]*3, axis=-1).astype(np.float32)
     else:
@@ -279,29 +268,17 @@ def _overlay(gray_img: np.ndarray, mask: np.ndarray, color_rgb, alpha=0.45) -> n
 
 
 def _overlap_map(pred: np.ndarray, gt: np.ndarray) -> np.ndarray:
-    """
-    Colour-coded overlap:
-      TP  = white  (255,255,255)
-      FN  = blue   (30,100,255)   missed by pred
-      FP  = orange (255,140,0)    over-predicted
-      TN  = dark   (30,30,30)
-    """
     pred, gt = pred.astype(bool), gt.astype(bool)
     rgb = np.full((*pred.shape, 3), 30, dtype=np.uint8)
     rgb[~pred & ~gt]  = [30,   30,  30]
-    rgb[ pred &  gt]  = [255, 255, 255]   # TP
-    rgb[~pred &  gt]  = [30,  100, 255]   # FN
-    rgb[ pred & ~gt]  = [255, 140,   0]   # FP
+    rgb[ pred &  gt]  = [255, 255, 255]
+    rgb[~pred &  gt]  = [30,  100, 255]
+    rgb[ pred & ~gt]  = [255, 140,   0]
     return rgb
 
 
 def make_case_figure(case_info: dict, pred_masks: dict, anno: dict,
                      metrics: dict, jpeg_root: str) -> plt.Figure:
-    """
-    One figure per case. Rows = sampled Z slices (lesion only).
-    Columns: [MRI] [GT overlay] [Pred overlay] [Overlap map]
-    Right side: per-slice metric text.
-    """
     sampled   = case_info['sampled']
     masks     = anno['masks']
     frames    = anno['frames']
@@ -309,7 +286,6 @@ def make_case_figure(case_info: dict, pred_masks: dict, anno: dict,
     jpeg_dir  = os.path.join(jpeg_root, vid)
     per_frame = {f['z']: f for f in metrics['per_frame']}
 
-    # Only show sampled slices that have GT annotation
     rows = [z for z in sampled if z < len(masks) and masks[z] is not None]
     if not rows:
         rows = sampled
@@ -320,12 +296,17 @@ def make_case_figure(case_info: dict, pred_masks: dict, anno: dict,
                              figsize=(n_cols * 3.2 + 2.5, n_rows * 3.0 + 1.2),
                              squeeze=False)
 
+    bboxes = case_info.get('add_bboxes', {})
+    key_z  = case_info.get('medsam2', {}).get('key_z') if case_info.get('medsam2') else None
+    refined = set(case_info.get('add_points', {}).keys())
+
     fig.suptitle(
         f"{vid}  |  target: {case_info['caption']}\n"
         f"Vol Dice={metrics['dice']:.3f}  "
         f"HD95={metrics['hd95']:.1f}  "
         f"Prec={metrics['precision']:.3f}  "
-        f"Recall={metrics['recall']:.3f}",
+        f"Recall={metrics['recall']:.3f}  "
+        f"|  key_z={key_z}  bboxes={len(bboxes)}  refined={len(refined)}",
         fontsize=11, fontweight='bold', y=0.995
     )
 
@@ -334,20 +315,16 @@ def make_case_figure(case_info: dict, pred_masks: dict, anno: dict,
         axes[0, c].set_title(title, fontsize=9, pad=4)
 
     for row, z in enumerate(rows):
-        # Load MRI slice
         frame_name = frames[z] + '.jpg'
         mri_path = os.path.join(jpeg_dir, frame_name)
         mri = np.array(Image.open(mri_path).convert('L'))
 
-        # GT mask
         m = masks[z] if z < len(masks) else None
         gt_2d = maskUtils.decode(m).astype(bool) if m is not None \
                 else np.zeros(mri.shape, dtype=bool)
 
-        # Predicted mask
         pred_2d = pred_masks.get(z, np.zeros(mri.shape, dtype=bool))
 
-        # Resize all to 512×512 for display consistency
         def _resize(arr_2d):
             if arr_2d.shape != (512, 512):
                 return np.array(Image.fromarray(arr_2d.astype(np.uint8) * 255)
@@ -359,11 +336,10 @@ def make_case_figure(case_info: dict, pred_masks: dict, anno: dict,
         if mri.shape != (512, 512):
             mri = np.array(Image.fromarray(mri).resize((512,512), Image.LANCZOS))
 
-        # Four panels
         panels = [
             mri,
-            _overlay(mri, gt_2d,   (30, 100, 255)),    # blue GT
-            _overlay(mri, pred_2d, (0,  200, 100)),    # green pred
+            _overlay(mri, gt_2d,   (30, 100, 255)),
+            _overlay(mri, pred_2d, (0,  200, 100)),
             _overlap_map(pred_2d, gt_2d),
         ]
         for c, panel in enumerate(panels):
@@ -374,11 +350,24 @@ def make_case_figure(case_info: dict, pred_masks: dict, anno: dict,
                 ax.imshow(panel)
             ax.axis('off')
 
-        # Z-index label on the left
-        axes[row, 0].set_ylabel(f'Z={z}', fontsize=8, rotation=0,
-                                labelpad=30, va='center')
+        # Phase-3 extras: draw predicted bbox on the MRI panel; flag key_z / refined z
+        bb = bboxes.get(z)
+        if bb:
+            sx = 512 / anno['img_w']
+            sy = 512 / anno['img_h']
+            rect = mpatches.Rectangle(
+                (bb[0]*sx, bb[1]*sy),
+                (bb[2]-bb[0])*sx, (bb[3]-bb[1])*sy,
+                linewidth=1.5, edgecolor='yellow', facecolor='none')
+            axes[row, 0].add_patch(rect)
 
-        # Per-slice metrics as text on the right
+        tags = []
+        if z == key_z: tags.append('★key')
+        if z in refined: tags.append('◆refined')
+        label = f'Z={z}' + (f'  {" ".join(tags)}' if tags else '')
+        axes[row, 0].set_ylabel(label, fontsize=8, rotation=0,
+                                labelpad=34, va='center')
+
         pf = per_frame.get(z)
         if pf:
             color = 'green' if pf['dice'] >= 0.7 else 'red'
@@ -394,13 +383,13 @@ def make_case_figure(case_info: dict, pred_masks: dict, anno: dict,
                 bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow',
                           edgecolor=color, alpha=0.85))
 
-    # Legend for overlap map
     legend_patches = [
         mpatches.Patch(color=(1,1,1),       label='TP'),
         mpatches.Patch(color=(0.12,0.39,1), label='FN (missed)'),
         mpatches.Patch(color=(1,0.55,0),    label='FP (over-pred)'),
+        mpatches.Patch(color=(1,1,0),       label='Predicted bbox'),
     ]
-    fig.legend(handles=legend_patches, loc='lower center', ncol=3,
+    fig.legend(handles=legend_patches, loc='lower center', ncol=4,
                fontsize=8, framealpha=0.9,
                bbox_to_anchor=(0.5, -0.01))
 
@@ -409,21 +398,20 @@ def make_case_figure(case_info: dict, pred_masks: dict, anno: dict,
 
 
 def make_summary_figure(all_metrics: list) -> plt.Figure:
-    """Bar chart of per-case metrics + box plots for the four metrics."""
     n = len(all_metrics)
     vids   = [m['vid'].replace('_image','')[-20:] for m in all_metrics]
     dices  = [m['dice']      for m in all_metrics]
-    hd95s  = [min(m['hd95'], 100) for m in all_metrics]   # cap inf for display
+    hd95s  = [min(m['hd95'], 100) for m in all_metrics]
     precs  = [m['precision'] for m in all_metrics]
     recs   = [m['recall']    for m in all_metrics]
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 9))
-    fig.suptitle('Phase-2 Val-set Segmentation Metrics (per case)', fontsize=13)
+    fig.suptitle('Phase-3 Val-set Segmentation Metrics (per case)', fontsize=13)
     x = np.arange(n)
     bar_kw = dict(edgecolor='black', linewidth=0.4)
 
     def _bar(ax, vals, title, color, ylim=(0,1)):
-        bars = ax.bar(x, vals, color=color, alpha=0.75, **bar_kw)
+        ax.bar(x, vals, color=color, alpha=0.75, **bar_kw)
         ax.axhline(np.mean(vals), color='red', linewidth=1.5,
                    linestyle='--', label=f'mean={np.mean(vals):.3f}')
         ax.set_title(title, fontsize=10)
@@ -436,7 +424,8 @@ def make_summary_figure(all_metrics: list) -> plt.Figure:
     _bar(axes[0,0], dices, 'Dice',      '#4c9be8')
     _bar(axes[0,1], precs, 'Precision', '#59c278')
     _bar(axes[1,0], recs,  'Recall',    '#f0a030')
-    _bar(axes[1,1], hd95s, 'HD95 (capped @ 100)', '#d9534f', ylim=(0, max(hd95s)*1.1+1))
+    _bar(axes[1,1], hd95s, 'HD95 (capped @ 100)', '#d9534f',
+         ylim=(0, max(hd95s)*1.1+1 if hd95s else 1))
 
     plt.tight_layout()
     return fig
@@ -452,7 +441,7 @@ def parse_args():
     p.add_argument('--data_root',   default='/BDSZ6/private/user/yxd/data/M3D/data_6-13/train')
     p.add_argument('--medsam2_ckpt', default=None)
     p.add_argument('--medsam2_cfg',  default=None)
-    p.add_argument('--output_dir',   default='/tmp/phase2_vis')
+    p.add_argument('--output_dir',   default='/tmp/phase3_vis')
     p.add_argument('--device',       default='cuda:4')
     p.add_argument('--max_samples',  type=int, default=None)
     return p.parse_args()
@@ -476,8 +465,8 @@ def main():
             cfg, args.medsam2_ckpt, device=device, apply_postprocessing=False)
         print(f"[MedSAM2] loaded  device={device}")
     else:
-        print("[MedSAM2] not provided — metrics will use dice_with_gt from tool_response "
-              "(HD95/Precision/Recall unavailable without re-running MedSAM2)")
+        print("[MedSAM2] not provided — pred masks will be empty "
+              "(metrics effectively compare GT vs all-zero).")
 
     # ── Load data ─────────────────────────────────────────────────────────────
     mask_dict, meta = load_data(args.data_root)
@@ -494,6 +483,9 @@ def main():
     for rec in tqdm(records, desc='Processing cases'):
         info = parse_record(rec)
         vid, caption = info['vid'], info['caption']
+        if not vid or not caption:
+            print(f"[WARN] skipped: missing vid or caption (vid={vid!r}, cap={caption!r})")
+            continue
 
         anno = anno_lookup.get((vid, caption))
         if anno is None:
@@ -502,41 +494,44 @@ def main():
 
         masks      = anno['masks']
         non_none_z = anno['non_none_z']
-        frames     = anno['frames']
         jpeg_dir   = os.path.join(jpeg_root, vid)
         img_w, img_h = anno['img_w'], anno['img_h']
 
-        # ── Run MedSAM2 with model's predictions ─────────────────────────────
+        # ── Re-run MedSAM2 using the model's predicted bbox + add_points ─────
         pred_masks: dict = {}
 
         if predictor is not None and info['medsam2'] is not None:
-            img_tensor, orig_H, orig_W = load_volume(jpeg_dir, device)
-            sx, sy = 512 / img_w, 512 / img_h
+            try:
+                img_tensor, orig_H, orig_W = load_volume(jpeg_dir, device)
+                sx, sy = 512 / img_w, 512 / img_h
 
-            ms = info['medsam2']
-            kbb = ms['bbox']
-            bbox_512 = np.array([kbb[0]*sx, kbb[1]*sy, kbb[2]*sx, kbb[3]*sy],
-                                 dtype=np.float32)
-            pred_masks = medsam2_propagate(
-                predictor, img_tensor, orig_H, orig_W,
-                ms['key_z'], bbox_512, device)
-
-            # Apply add_point corrections
-            for z, pt_info in info['add_points'].items():
-                pts_512 = np.array([[p[0]*sx, p[1]*sy] for p in pt_info['points']],
-                                   dtype=np.float32)
-                lbls = np.array(pt_info['labels'], dtype=np.int32)
-                pred_masks[z] = medsam2_point(
+                ms  = info['medsam2']
+                kbb = ms['bbox']
+                bbox_512 = np.array(
+                    [kbb[0]*sx, kbb[1]*sy, kbb[2]*sx, kbb[3]*sy],
+                    dtype=np.float32)
+                pred_masks = medsam2_propagate(
                     predictor, img_tensor, orig_H, orig_W,
-                    z, pts_512, lbls, device)
-        else:
-            # Fallback: use GT mask shapes as zero-filled placeholders
+                    ms['key_z'], bbox_512, device)
+
+                for z, pt_info in info['add_points'].items():
+                    pts_512 = np.array(
+                        [[p[0]*sx, p[1]*sy] for p in pt_info['points']],
+                        dtype=np.float32)
+                    lbls = np.array(pt_info['labels'], dtype=np.int32)
+                    pred_masks[z] = medsam2_point(
+                        predictor, img_tensor, orig_H, orig_W,
+                        z, pts_512, lbls, device)
+            except Exception as e:
+                print(f"[ERR] MedSAM2 inference failed for {vid}: {e}")
+                pred_masks = {}
+
+        if not pred_masks:
             for z in info['sampled']:
                 m = masks[z] if z < len(masks) else None
                 shape = maskUtils.decode(m).shape if m is not None else (512, 512)
                 pred_masks[z] = np.zeros(shape, dtype=bool)
 
-        # ── Compute metrics ───────────────────────────────────────────────────
         metrics = compute_metrics(pred_masks, masks, non_none_z)
         metrics['vid']     = vid
         metrics['caption'] = caption
@@ -549,27 +544,27 @@ def main():
             f"Recall={metrics['recall']:.3f}"
         )
 
-        # ── Generate per-case figure ──────────────────────────────────────────
         fig = make_case_figure(info, pred_masks, anno, metrics, jpeg_root)
-        fig_path = os.path.join(fig_dir, f"{vid}.png")
+        cap_slug = re.sub(r'[^a-z0-9]+', '-', caption.lower()).strip('-')[:40] or 'x'
+        fig_path = os.path.join(fig_dir, f"{vid}__{cap_slug}.png")
         fig.savefig(fig_path, dpi=130, bbox_inches='tight')
         plt.close(fig)
 
-    # ── Summary figure ────────────────────────────────────────────────────────
     if all_metrics:
         sfig = make_summary_figure(all_metrics)
-        sfig.savefig(os.path.join(args.output_dir, 'summary.png'), dpi=130, bbox_inches='tight')
+        sfig.savefig(os.path.join(args.output_dir, 'summary.png'),
+                     dpi=130, bbox_inches='tight')
         plt.close(sfig)
 
-    # ── Aggregate metrics ─────────────────────────────────────────────────────
     finite_hd = [m['hd95'] for m in all_metrics if m['hd95'] != float('inf')]
     print("\n" + "=" * 56)
     print(f"{'Metric':<16} {'Mean':>8}  {'Std':>8}  {'Min':>8}  {'Max':>8}")
     print("=" * 56)
     for key in ('dice', 'precision', 'recall'):
         v = [m[key] for m in all_metrics]
-        print(f"{key:<16} {np.mean(v):>8.4f}  {np.std(v):>8.4f}"
-              f"  {np.min(v):>8.4f}  {np.max(v):>8.4f}")
+        if v:
+            print(f"{key:<16} {np.mean(v):>8.4f}  {np.std(v):>8.4f}"
+                  f"  {np.min(v):>8.4f}  {np.max(v):>8.4f}")
     if finite_hd:
         print(f"{'hd95 (finite)':<16} {np.mean(finite_hd):>8.2f}  "
               f"{np.std(finite_hd):>8.2f}  "
@@ -579,7 +574,6 @@ def main():
     print("=" * 56)
     print(f"Cases: {len(all_metrics)}")
 
-    # ── Save per-case CSV ─────────────────────────────────────────────────────
     csv_path = os.path.join(args.output_dir, 'metrics.csv')
     with open(csv_path, 'w') as f:
         f.write('vid,caption,dice,hd95,precision,recall\n')

@@ -12,7 +12,7 @@ A 3D MRI lesion segmentation agent based on **Qwen3-VL** + **ms-swift** parallel
 |---|---|---|---|---|
 | **Phase 1** | Predict bbox per slice across 10 sampled slices | 10 slices + Z indices | `[x1,y1,x2,y2]` per slice | **Done** |
 | **Phase 2** | Use MedSAM2 to generate masks from bbox, refine with points | Same + bbox results | Per-slice segmentation mask | **Done** |
-| **Phase 3** | Dynamic scroll/get_slice interactive segmentation | Single slice + history | Full 3D segmentation | Next |
+| **Phase 3** | Interactive segmentation on 10 sampled slices via `scroll` / `get_slice` | Task + Z-range metadata + on-demand single-slice reads | Per-slice segmentation of the same 10 sampled slices (same scope as Phase 2) | **Done (data pipeline)** |
 
 ## Repository Structure
 
@@ -29,6 +29,7 @@ medagent/
 └── Qwen3_VL/
     ├── train.sh                                # Phase 1 LoRA training (GPU 4,5)
     ├── train_phase2.sh                         # Phase 2 LoRA training (GPU 4,5,6,7)
+    ├── train_phase3.sh                         # Phase 3 LoRA training (GPU 3,7; max_length=16384)
     ├── infer.py                                # Phase 1 batch inference (IoU/mAP)
     ├── infer_phase2.py                         # Phase 2 agent inference (Dice/HD95)
     ├── visualize_phase2.py                     # Phase 2 result visualizer
@@ -36,6 +37,7 @@ medagent/
     ├── convert_to_swift_grounding.py           # Phase 1 data: M3D → ms-swift JSONL
     ├── convert_to_agent_trajectory.py          # Phase 1 agent trajectory generator
     ├── convert_to_agent_trajectory_phase2.py   # Phase 2 trajectory generator
+    ├── convert_to_agent_trajectory_phase3.py   # Phase 3 trajectory generator (scroll + get_slice)
     ├── medsam2_phase2.py                       # Standalone MedSAM2 inference + Dice
     ├── PHASE2_WORKFLOW.md                      # Full Phase 2 documentation
     ├── mri_grounding_train.jsonl               # Phase 1 training dataset
@@ -196,8 +198,8 @@ TOOLS = [
 Tool evolution across phases:
 ```
 Phase 1  add_bbox  finish_bbox_annotation
-Phase 2  add_bbox  add_point  finish_3d_segmentation
-Phase 3  add_bbox  add_point  scroll  get_slice  finish_3d_segmentation
+Phase 2  add_bbox  run_medsam2  add_point  finish_3d_segmentation
+Phase 3  add_bbox  run_medsam2  add_point  scroll  get_slice  finish_3d_segmentation
 ```
 Phase 1 JSONL format is fully compatible with later phases — only the `tools` field needs to be extended.
 
@@ -531,13 +533,283 @@ anno    = anno_lookup[(vid, caption)]
 
 ---
 
-## Phase 3 Design Notes (upcoming)
+## Phase 3 Design Spec (upcoming)
 
-Phase 3 adds interactive scrolling: the agent can call `scroll(delta)` and `get_slice(z)` to navigate the volume on demand, rather than being shown all 10 slices upfront. This enables finer-grained control for difficult cases and is compatible with the Phase 2 tool set (just add `scroll` and `get_slice`).
+### Goal
 
-Planned tool set:
+Extend Phase 2 with two navigation tools — `scroll(delta)` and `get_slice(z_index)` — so the agent **loads slices on demand, one at a time**, rather than receiving all 10 upfront. The agent reads a single slice, reasons about its spatial position from conversational context (prior slice reads, Z indices, accumulated CoT), and decides where to move next. The segmentation scope stays the **same 10 sampled Z slices** as Phase 2 — not the full volume. After `run_medsam2` propagates masks across those 10 slices, the agent can **scroll back through them** to inspect each mask and trigger `add_point` refinements on poor slices.
+
+The core shift vs. Phase 2 is **perceptual**: instead of a static bird's-eye view of 10 slices at Turn 1, the agent must actively build its spatial model of the volume through sequential single-slice reads, mimicking how a radiologist scrolls through a DICOM viewer.
+
+### Key Differences from Phase 2
+
+| Aspect | Phase 2 | Phase 3 |
+|---|---|---|
+| Turn 1 input | Task + all 10 slices shown at once | Task + Z-range metadata only (no slice images) |
+| Spatial analysis | Single CoT after seeing all slices | Incremental CoT, updated after each `get_slice` / `scroll` |
+| Bbox annotation | Parallel `add_bbox` on all slices in one turn | Interleaved with navigation (annotate a slice → move to next) |
+| Mask review | Global review after one `run_medsam2` response | Scroll through segmented slices; inspect one at a time |
+| Segmentation target | 10 sampled slices (MedSAM2 propagation) | Same 10 sampled slices (same MedSAM2 call, same scope) |
+| Max trajectory images | ~32 (10 inputs + renders) | ~40–60 (one per navigation step + renders) |
+
+### Tool Specification — `scroll` and `get_slice`
+
+This subsection is the complete contract for the two new navigation tools. The other four tools (`add_bbox`, `run_medsam2`, `add_point`, `finish_3d_segmentation`) keep their Phase 2 semantics unchanged. The environment, the trajectory generator, and the model must all respect the invariants listed here.
+
+#### Shared Concepts
+
+| Concept | Definition |
+|---|---|
+| `Z_list` | The 10 Z indices produced by `np.linspace(z_min, z_max, 10, dtype=int)`. Fixed at Turn 1, echoed in the user message, immutable for the rest of the trajectory. |
+| Ordinal `i ∈ {0..9}` | Position of a slice within `Z_list`. `Z_list[i]` is its Z. All navigation is expressed over ordinals internally. |
+| Current ordinal `i_cur` | The environment's pointer to the slice "currently on screen". Undefined before the first `get_slice`; updated by every `scroll` / `get_slice`. |
+| Overlay state per slice | Each of the 10 slices carries up to three overlays: `bbox` (set by `add_bbox`), `mask` (set after `run_medsam2`), `refined_mask` (set by `add_point`). The rendered image always shows the most recent overlay. |
+| Scope restriction | Navigation is limited to the 10 sampled Z. Non-sampled Z cannot be read. |
+
+#### Tool 1 — `get_slice`
+
+**Purpose.** Random-access read. Use for initial exploration, jumping to a specific slice identified in a prior review, or re-inspecting after a refinement.
+
+```python
+{
+    "type": "function",
+    "function": {
+        "name": "get_slice",
+        "description": (
+            "Jump directly to a sampled Z slice and read it. Use this for non-adjacent moves — "
+            "initial exploration, jumping to a specific slice identified in review, or re-checking "
+            "a slice after refinement. z_index must be one of the 10 sampled Z values."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "z_index": {
+                    "type": "integer",
+                    "description": "Target Z index. Must be a member of the sampled Z list echoed in the user turn."
+                }
+            },
+            "required": ["z_index"]
+        }
+    }
+}
 ```
-add_bbox   run_medsam2   add_point   scroll(delta)   get_slice(z)   finish_3d_segmentation
+
+**Effect.** Sets `i_cur = Z_list.index(z_index)`; returns the slice image with any current overlays.
+
+**Validation.**
+- `z_index ∈ Z_list` — otherwise the environment returns an error tool_response (`{"error": "z_index not in sampled set", "sampled_z_list": [...]}`) and `i_cur` is unchanged.
+- Re-reading the current slice (`z_index == Z_list[i_cur]`) is legal but discouraged unless overlay state has changed since the last read.
+
+#### Tool 2 — `scroll`
+
+**Purpose.** Relative navigation. Use for neighbor inspection, sequential sweeps, and walking through masks during review.
+
+```python
+{
+    "type": "function",
+    "function": {
+        "name": "scroll",
+        "description": (
+            "Move the slice pointer by `delta` positions within the sampled Z list. "
+            "delta=+1 moves to the next slice (higher Z), delta=-1 to the previous (lower Z). "
+            "Use for adjacent moves; for jumps of 3 or more positions use get_slice."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "delta": {
+                    "type": "integer",
+                    "description": "Step in the sampled-list ordering. Typical values: ±1, ±2. Allowed range: ±9, excluding 0."
+                }
+            },
+            "required": ["delta"]
+        }
+    }
+}
 ```
 
-The Phase 2 dataset JSONL format is already forward-compatible — only the `tools` field needs extension.
+**Effect.** Sets `i_cur = clamp(i_cur + delta, 0, 9)`; returns the new slice image with overlays.
+
+**Validation.**
+- `delta == 0` is rejected (no-op).
+- Out-of-bounds scrolls are **clamped, not rejected**: `scroll(delta=+5)` from `i_cur=7` lands at `i_cur=9` with `clamped: true` in the response. The model learns to recognize boundaries through this signal rather than by error handling.
+- `scroll` before any `get_slice` is illegal — the pointer is undefined. The environment returns `{"error": "pointer not initialized — call get_slice first"}`.
+
+#### Tool Response Contract (both tools)
+
+Both navigation tools return a single-image tool_response with this shape:
+
+```json
+{
+  "z_index": 55,
+  "ordinal": 5,
+  "slice_image": "<image>",
+  "sampled_z_list": [40, 43, 46, 50, 53, 56, 60, 63, 66, 70],
+  "overlays": {
+    "has_bbox": true,
+    "bbox": [148, 112, 172, 138],
+    "has_mask": true,
+    "mask_dice": 0.81,
+    "has_refined_mask": false
+  },
+  "boundary": {
+    "at_start": false,
+    "at_end": false,
+    "clamped": false
+  },
+  "history": {
+    "visited_ordinals": [5, 4, 6, 3],
+    "annotated_ordinals": [5, 4, 6],
+    "unvisited_ordinals": [0, 1, 2, 7, 8, 9]
+  }
+}
+```
+
+The rendered `slice_image` is the raw 512-px slice with the most recent overlay baked in — box stroke for `bbox`, translucent color fill for `mask` / `refined_mask`. Render images are downsampled to **256×256** before serialization to stay within the vision-token budget (Phase 2 convention carries over).
+
+The `history` block is the model's only memory of where it has been — all spatial reasoning CoT must cite it explicitly rather than re-derive it.
+
+#### Navigation Phases (A / B / C)
+
+A Phase 3 trajectory splits into three phases. The trajectory generator emits this structure and the model learns it through SFT.
+
+| Phase | Purpose | Dominant tool | Typical count | Ends when |
+|---|---|---|---|---|
+| **A — Exploration** | Locate the key slice, build the initial spatial model | `get_slice` (1–2 calls), then `scroll ±1` for neighbor probing | 3–5 reads | Key slice announced in CoT |
+| **B — Annotation** | Cover every lesion-containing slice with a bbox | `scroll ±1` / `scroll ±2` interleaved with `add_bbox`; `get_slice` only for jumps of ≥ 3 ordinals | `unvisited_ordinals` is empty | All lesion slices have bboxes |
+| **C — Mask Review** | After `run_medsam2`, inspect per-slice masks and refine poor ones | Sequential `scroll +1` sweep from ordinal 0; `get_slice` for flagged poor slices | 2–10 reads | All Dice ≥ 0.70 or agent deems done |
+
+Phase A → B transition is marked by `run_medsam2`'s prerequisite ("all lesion slices have bboxes"), Phase B → C by the `run_medsam2` tool_call itself, and Phase C by `finish_3d_segmentation`.
+
+#### Decision Heuristics (what the model should learn)
+
+These are not hard rules but learnable preferences that the trajectory generator encodes:
+
+- **Start middle, widen outward.** First `get_slice` targets ordinal 4 or 5. Subsequent moves are `scroll ±1` until boundary or no-lesion slice is confirmed.
+- **Prefer `scroll` for adjacency, `get_slice` for jumps.** |delta| ≤ 2 → `scroll`; |delta| ≥ 3 → `get_slice`. This encodes the two-tool division of labor.
+- **Never revisit unless state changed.** A slice already in `visited_ordinals` should only be revisited after `run_medsam2` (new mask) or `add_point` (new refined mask) altered its overlay.
+- **Key-slice identification is online.** Unlike Phase 2's offline `argmax(areas)`, the model compares bbox sizes across visited slices in CoT and commits to a `key_z` choice before `run_medsam2`.
+- **Phase C default sweep**: `get_slice(Z_list[0])` → `scroll(+1)` × 9. Break the sweep with `get_slice` only for non-adjacent poor slices identified from the `run_medsam2` response.
+
+#### Interaction With Existing Tools
+
+| Tool | Precondition on `i_cur` | Effect on `i_cur` | Notes |
+|---|---|---|---|
+| `add_bbox` | `z_index == Z_list[i_cur]` — must be looking at the target | unchanged | Core "look-then-write" binding |
+| `run_medsam2` | every lesion-containing ordinal is in `annotated_ordinals` | unchanged | Single global call; key_z free-choice but must be in `Z_list` |
+| `add_point` | `z_index == Z_list[i_cur]` — must be looking at the target | unchanged | Same "look-then-write" binding as add_bbox |
+| `finish_3d_segmentation` | no precondition; terminal | — | Must be the last tool_call in the trajectory |
+
+The `z_index == Z_list[i_cur]` constraint on `add_bbox` / `add_point` is the central mechanism that forces **read-before-write**. Violations during inference are rejected by the environment with retry hints; violations in training data are a dataset bug.
+
+#### State Invariants
+
+The environment validates these across the whole trajectory:
+
+1. `i_cur ∈ {0..9}` once initialized; undefined before the first `get_slice`.
+2. `Z_list` is immutable after Turn 1.
+3. Every `<image>` token in the tool_response stream corresponds to exactly one of: navigation read, `add_bbox` render, `run_medsam2` mask batch, `add_point` refinement render.
+4. `add_bbox` / `add_point` without a matching current view are rejected.
+5. `run_medsam2` fires **exactly once** per trajectory and only after Phase B completes.
+6. `finish_3d_segmentation` is the last tool_call and is unique per trajectory.
+7. The ordered sequence of `<image>` tokens in `messages` matches the `images` list entry-by-entry.
+
+#### Implementation Hint for the Trajectory Generator
+
+A scripted plan for one training sample looks like this; `convert_to_agent_trajectory_phase3.py` will realize it into a JSONL trajectory with CoT narration at each phase transition:
+
+```python
+def build_navigation_plan(sampled_z, areas, gt_masks_sampled):
+    plan = []
+    key_ord = int(np.argmax(areas))              # offline oracle; CoT will rediscover it online
+    mid = len(sampled_z) // 2                    # ordinal 5 for a list of 10
+    cur = mid
+
+    # -------- Phase A: exploration --------
+    plan.append(("get_slice", sampled_z[mid]))
+    for d in (+1, -1, +2, -2):                   # fan out two steps each way
+        plan.append(("scroll", d))
+        cur += d
+
+    # -------- Phase B: annotation walk --------
+    order = sorted(range(10), key=lambda i: abs(i - mid))   # spiral outward from middle
+    visited = set()
+    for i in order:
+        if sampled_z[i] in visited:
+            continue
+        step = i - cur
+        if abs(step) >= 3:
+            plan.append(("get_slice", sampled_z[i]))
+        elif step != 0:
+            plan.append(("scroll", step))
+        cur = i
+        visited.add(sampled_z[i])
+        if areas[i] > 0:
+            plan.append(("add_bbox", sampled_z[i], extract_bbox(gt_masks_sampled[i])))
+
+    # -------- Transition: run MedSAM2 --------
+    plan.append(("run_medsam2", sampled_z[key_ord], bbox_at_ordinal[key_ord]))
+
+    # -------- Phase C: mask review sweep --------
+    plan.append(("get_slice", sampled_z[0]))
+    cur = 0
+    for i in range(1, 10):
+        plan.append(("scroll", +1))
+        cur = i
+        if dice_after_medsam2[i] < 0.70:
+            plan.append(("add_point", sampled_z[i], sample_fg_bg_points(gt_masks_sampled[i])))
+
+    plan.append(("finish_3d_segmentation",))
+    return plan
+```
+
+The generator wraps each phase boundary with CoT that references the `history` block (`"I've visited ordinals [5,4,6,3,7] so far — ordinal 4 had the largest bbox, tentatively the key slice"`) rather than with oracle knowledge. This is what trains the model to reason from context rather than from the dataset.
+
+### Expected Trajectory Structure (sketch)
+
+```
+Turn 1    [user]         Task + lesion Z-range + sampled Z list (e.g. "10 slices at Z=[40,43,46,...,70]")
+Turn 2    [assistant]    Opening CoT: "I'll start from the middle slice to locate the key cross-section."
+Turn 3    [tool_call]    get_slice(z_index=55)
+Turn 4    [tool_resp]    Slice image at Z=55
+Turn 5    [assistant]    CoT: "Lesion visible, ~30×40 px, well-centered. Likely near the key slice. Marking bbox."
+Turn 6    [tool_call]    add_bbox(z_index=55, bbox=[...])
+Turn 7    [tool_resp]    Bbox render + IoU
+Turn 8    [tool_call]    scroll(delta=-1)   # check neighbor
+...
+(continue navigating + annotating the remaining 9 slices)
+...
+Turn K    [assistant]    "All 10 slices annotated. Key slice is Z=55. Launching MedSAM2."
+Turn K+1  [tool_call]    run_medsam2(key_z=55, bbox=[...])
+Turn K+2  [tool_resp]    All 10 mask overlays + Dice per slice
+Turn K+3  [assistant]    Mask review CoT: "Z=46 and Z=60 have Dice < 0.70 — will inspect."
+Turn K+4  [tool_call]    get_slice(z_index=46)
+Turn K+5  [tool_resp]    Slice with current mask overlay at Z=46
+Turn K+6  [tool_call]    add_point(z_index=46, points=[...], labels=[...])
+Turn K+7  [tool_resp]    Refined mask + new Dice
+Turn K+8  [tool_call]    scroll(delta=+4)  # jump to next poor slice
+...
+Turn N    [assistant]    "All slices pass. Segmentation complete."
+Turn N+1  [tool_call]    finish_3d_segmentation()
+```
+
+### Spatial Reasoning From Context
+
+Because the agent no longer sees the full sampled stack at Turn 1, it must rely on **context memory** to build spatial understanding:
+
+- **Z indices carried in every tool_response** anchor each slice image to a known axial position.
+- **Accumulated CoT after each slice read** should track what's been observed (e.g. "Z=55 lesion ~30×40, Z=50 lesion slightly smaller — likely shrinking downward").
+- **Key-slice identification** becomes an *online* decision, refined as more slices are read, rather than an offline computation over all 10 at once.
+
+This is the central training signal Phase 3 must capture: the model learns to produce spatially-grounded CoT that accumulates partial observations into a coherent 3D picture before committing to `run_medsam2`.
+
+### Format Compatibility
+
+The Phase 2 JSONL schema remains forward-compatible:
+
+- `tools` field is extended with `scroll` and `get_slice`.
+- `messages` structure is unchanged — only the turn count grows and the image-token ordering shifts (one new `<image>` per navigation tool_response, instead of 10 at Turn 1).
+- `images` list still tracks every `<image>` token in appearance order.
+- Loss computation rules (assistant CoT + tool_calls contribute to loss; tool_responses and user messages do not) carry over unchanged.
+
+Trajectory generation will reuse the Phase 2 MedSAM2 propagation protocol verbatim — only the framing around `run_medsam2` changes (navigation-driven preamble + scroll-based review loop).
