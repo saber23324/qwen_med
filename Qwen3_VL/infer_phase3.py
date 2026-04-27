@@ -38,6 +38,18 @@ python Qwen3_VL/infer_phase3.py \
     --medsam2_cfg  /home/yxd/medagent/MedSAM2/sam2/configs/sam2.1_hiera_t512.yaml \
     --output_dir /BDSZ6/private/user/yxd/dtos_output/qwen/agent_phase3_18-22/output
     --device cuda:0
+
+
+CUDA_VISIBLE_DEVICES=4,5 \
+QWENVL_BBOX_FORMAT='new' \
+python Qwen3_VL/infer_phase3.py \
+    --model  /BDSZ6/private/user/yxd/models/Qwen3-VL-8B-Instruct \
+    --ckpt   /BDSZ6/private/user/yxd/dtos_output/qwen/agent_phase3_4/v1-20260424-002223/checkpoint-4800 \
+    --val_jsonl /BDSZ6/private/user/yxd/data/qwen/agent_phase3_4/agent_val_subset.jsonl \
+    --data_root /BDSZ6/private/user/yxd/data/M3D/data_4/train \
+    --medsam2_ckpt /home/yxd/medagent/MedSAM2/checkpoints/MedSAM2/MedSAM2_latest.pt \
+    --medsam2_cfg  /home/yxd/medagent/MedSAM2/sam2/configs/sam2.1_hiera_t512.yaml \
+    --output_dir /BDSZ6/private/user/yxd/dtos_output/qwen/agent_phase3_4/output
 """
 
 import argparse

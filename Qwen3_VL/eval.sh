@@ -21,3 +21,8 @@ swift eval \
 
 # ValueError: Unrecognized model in /BDSZ6/private/user/yxd/dtos_output/qwen/v0-20260329-025317/checkpoint-17000. Should have a `model_type` key in its config.json.
     --dataset '/BDSZ6/private/user/yxd/data/qwen/data_6/mri_grounding_train.jsonl' \
+
+
+swift export \
+    --adapters /BDSZ6/private/user/yxd/dtos_output/qwen/agent_phase3_18-22/v2-20260422-230040/checkpoint-4050 \
+    --merge_lora true
