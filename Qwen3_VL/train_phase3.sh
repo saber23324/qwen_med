@@ -15,6 +15,7 @@ swift sft \
     --model /BDSZ6/private/user/yxd/models/Qwen3-VL-8B-Instruct \
     --dataset '/BDSZ6/private/user/yxd/data/qwen/agent_phase3/agent_train.jsonl' \
     --val_dataset '/BDSZ6/private/user/yxd/data/qwen/agent_phase3/agent_val.jsonl' \
+    --resume_from_checkpoint <your_checkpoint_path>\
     --agent_template hermes \
     --load_from_cache_file true \
     --tuner_type lora \

@@ -42,6 +42,14 @@ conda run -n dtos_test python3 Qwen3_VL/convert_to_agent_trajectory_phase3.py \
 --ckpt  /home/yxd/medagent/MedSAM2/checkpoints/MedSAM2/MedSAM2_latest.pt \
 --cfg   /home/yxd/medagent/MedSAM2/sam2/configs/sam2.1_hiera_t512.yaml \
 --device cuda:4
+
+conda run -n dtos_test python3 Qwen3_VL/convert_to_agent_trajectory_phase3.py \
+--data_root  /BDSZ6/private/user/yxd/data/M3D/data_4/train \
+--output_dir /BDSZ6/private/user/yxd/data/qwen/agent_phase3_4 \
+--ckpt  /home/yxd/medagent/MedSAM2/checkpoints/MedSAM2/MedSAM2_latest.pt \
+--cfg   /home/yxd/medagent/MedSAM2/sam2/configs/sam2.1_hiera_t512.yaml \
+--device cuda:4
+
 """
 
 import argparse

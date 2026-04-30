@@ -22,7 +22,7 @@ v3-20260417-100443/checkpoint-300/infer_result/20260418-145802.jsonl \
         --data_root   /BDSZ6/private/user/yxd/data/M3D/data_6-13/train \
         --medsam2_ckpt /home/yxd/medagent/MedSAM2/checkpoints/MedSAM2/MedSAM2_latest.pt \
         --medsam2_cfg  /home/yxd/medagent/MedSAM2/sam2/configs/sam2.1_hiera_t512.yaml \
-        --output_dir  /home/yxd/medagent/output \
+        --output_dir  /home/yxd/medagent/output2 \
         --device cuda:4
 """
 

@@ -9,7 +9,7 @@ filename.
 
 Usage:
     conda run -n dtos_test python3 Qwen3_VL/visualize_phase3.py \
-        --infer_jsonl /BDSZ6/private/user/yxd/dtos_output/qwen/agent_phase3/v0-20260419-225116/checkpoint-200/infer_result \
+        --infer_jsonl /BDSZ6/private/user/yxd/dtos_output/qwen/agent_phase3/v0-20260419-225116/checkpoint-200/infer_result/20260420-100310.jsonl\
         --data_root   /BDSZ6/private/user/yxd/data/M3D/data_6-13/train \
         --medsam2_ckpt /home/yxd/medagent/MedSAM2/checkpoints/MedSAM2/MedSAM2_latest.pt \
         --medsam2_cfg  /home/yxd/medagent/MedSAM2/sam2/configs/sam2.1_hiera_t512.yaml \

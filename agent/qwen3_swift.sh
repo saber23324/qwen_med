@@ -13,6 +13,8 @@ swift  sft \
     --per_device_eval_batch_size 1 \
     --learning_rate 1e-5 \
     --gradient_accumulation_steps 8 \
+    --lora_rank 64 \
+    --lora_alpha 128 \
     --eval_steps 100 \
     --save_steps 100 \
     --save_total_limit 2 \

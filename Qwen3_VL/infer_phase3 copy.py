@@ -27,7 +27,7 @@ Metrics: Dice, HD95, Precision, Recall — same as Phase 2.
 
 Usage:
     conda run -n qwen3 
-CUDA_VISIBLE_DEVICES=4,5 \
+CUDA_VISIBLE_DEVICES=5 \
 QWENVL_BBOX_FORMAT='new' \
 python Qwen3_VL/infer_phase3.py \
     --model  /BDSZ6/private/user/yxd/models/Qwen3-VL-8B-Instruct \
@@ -36,10 +36,9 @@ python Qwen3_VL/infer_phase3.py \
     --data_root /BDSZ6/private/user/yxd/data/M3D/data_18-22/train \
     --medsam2_ckpt /home/yxd/medagent/MedSAM2/checkpoints/MedSAM2/MedSAM2_latest.pt \
     --medsam2_cfg  /home/yxd/medagent/MedSAM2/sam2/configs/sam2.1_hiera_t512.yaml \
-    --output_dir /BDSZ6/private/user/yxd/dtos_output/qwen/agent_phase3_18-22/output
+    --output_dir /BDSZ6/private/user/yxd/dtos_output/qwen/agent_phase3_18-22/output_turn_5
     --device cuda:0
 
-CUDA_VISIBLE_DEVICES=4 QWENVL_BBOX_FORMAT='new' python Qwen3_VL/infer_phase3.py     --model  /BDSZ6/private/user/yxd/models/Qwen3-VL-8B-Instruct     --ckpt   /BDSZ6/private/user/yxd/dtos_output/qwen/agent_phase3_18-22/v2-20260422-230040/checkpoint-4050     --val_jsonl /BDSZ6/private/user/yxd/data/qwen/agent_phase3_18-22/test.jsonl     --data_root /BDSZ6/private/user/yxd/data/M3D/data_18-22/train     --medsam2_ckpt /home/yxd/medagent/MedSAM2/checkpoints/MedSAM2/MedSAM2_latest.pt     --medsam2_cfg  /home/yxd/medagent/MedSAM2/sam2/configs/sam2.1_hiera_t512.yaml     --output_dir /BDSZ6/private/user/yxd/dtos_output/qwen/agent_phase3_18-22/output4 --visualize_all
 
 CUDA_VISIBLE_DEVICES=4 \
 QWENVL_BBOX_FORMAT='new' \
@@ -81,8 +80,8 @@ N_SLICES        = 10
 RENDER_SIZE     = 256
 IMG_MEAN        = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32)
 IMG_STD         = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32)
-MAX_AGENT_TURNS = 20
-DICE_PASS       = 0.20
+MAX_AGENT_TURNS = 60
+DICE_PASS       = 0.70
 
 BBOX_COLOR     = (255, 80, 80)
 POINT_FG_COLOR = (255, 50, 50)
@@ -663,49 +662,7 @@ def parse_args():
                    help='Replay the GT tool_call sequence from --val_jsonl instead '
                         'of running the model. Reproduces the oracle pipeline ceiling '
                         '(matches visualize_phase3.py). Skips LLM loading.')
-    p.add_argument('--visualize_all', action='store_true',
-                   help='After the agent loop, save a predicted-mask overlay PNG '
-                        'for every JPEG in jpeg_root (not just the 10 sampled '
-                        'slices). Output: <output_dir>/all_vis/<vid>/z<zzz>.png')
     return p.parse_args()
-
-
-def save_volume_visualizations(executor, viz_root):
-    """Save a full-resolution predicted-mask overlay for every JPEG in jpeg_root.
-
-    Output: <viz_root>/<vid>/z<zzz>.png. The image is composited at the mask's
-    resolution (512×512), so the original JPEG is upsampled if needed; bbox is
-    drawn for sampled slices that the agent annotated.
-    """
-    out_dir = os.path.join(viz_root, executor.vid)
-    os.makedirs(out_dir, exist_ok=True)
-    bbox_at_z = {executor.sampled[i]: executor.bboxes_by_ord[i]
-                 for i in executor.bboxes_by_ord
-                 if 0 <= i < len(executor.sampled)}
-    saved = []
-    for z, name in enumerate(executor.frames):
-        slice_path = os.path.join(executor.jpeg_dir, name + '.jpg')
-        if not os.path.exists(slice_path):
-            continue
-        pred = executor.final_masks.get(z)
-        if pred is None:
-            pred = np.zeros((512, 512), dtype=bool)
-        H, W = pred.shape
-        img = Image.open(slice_path).convert('RGBA')
-        if (img.size[0], img.size[1]) != (W, H):
-            img = img.resize((W, H), Image.LANCZOS)
-        overlay = Image.new('RGBA', (W, H), (0, 0, 0, 0))
-        px = np.zeros((H, W, 4), dtype=np.uint8)
-        px[pred.astype(bool)] = [0, 200, 100, 120]
-        overlay.paste(Image.fromarray(px, 'RGBA'))
-        img = Image.alpha_composite(img, overlay).convert('RGB')
-        bbox = bbox_at_z.get(z)
-        if bbox is not None:
-            ImageDraw.Draw(img).rectangle(bbox, outline=BBOX_COLOR, width=2)
-        out_path = os.path.join(out_dir, f"z{z:03d}.png")
-        img.save(out_path)
-        saved.append(out_path)
-    return saved
 
 
 def replay_trajectory(rec, executor):
@@ -746,9 +703,6 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     render_dir = os.path.join(args.output_dir, 'renders')
     os.makedirs(render_dir, exist_ok=True)
-    all_vis_dir = os.path.join(args.output_dir, 'all_vis')
-    if args.visualize_all:
-        os.makedirs(all_vis_dir, exist_ok=True)
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
 
@@ -845,12 +799,6 @@ def main():
         metrics = evaluate_case(final_masks, masks, non_none_z)
         metrics.update(vid=vid, caption=anno['caption'], finished=done,
                         n_turns=len(executor.visited))
-        if args.visualize_all:
-            try:
-                save_volume_visualizations(executor, all_vis_dir)
-            except Exception as e:
-                print(f"\n[WARN] visualize_all failed for {vid}: "
-                      f"{type(e).__name__}: {e}")
         all_results.append(metrics)
         tqdm.write(
             f"  {vid}  Dice={metrics['dice']:.3f}  HD95={metrics['hd95']:.1f}  "
@@ -883,8 +831,6 @@ def main():
     print(f"\nFinished cleanly: {finished}/{len(all_results)}")
     print(f"Results saved to: {results_path}")
     print(f"Renders in:       {render_dir}/")
-    if args.visualize_all:
-        print(f"Volume visualizations in: {all_vis_dir}/")
 
 
 if __name__ == '__main__':
